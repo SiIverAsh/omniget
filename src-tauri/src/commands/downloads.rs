@@ -11,7 +11,7 @@ use crate::AppState;
 #[cfg(not(target_os = "android"))]
 use crate::core::ytdlp;
 #[cfg(not(target_os = "android"))]
-use crate::models::media::{FormatInfo, MediaType};
+use crate::models::media::{FormatInfo, MediaInfo, MediaType};
 
 #[derive(Clone, Serialize)]
 pub struct PlatformInfo {
@@ -155,6 +155,28 @@ pub async fn prefetch_media_info(
 pub struct DownloadStarted {
     pub id: u64,
     pub title: String,
+}
+
+#[cfg(not(target_os = "android"))]
+fn filter_playlist_info(mut info: MediaInfo, selected_items: &[u32]) -> MediaInfo {
+    if selected_items.is_empty() || info.media_type != MediaType::Playlist {
+        return info;
+    }
+
+    let set: std::collections::HashSet<u32> = selected_items.iter().copied().collect();
+    let filtered: Vec<_> = info
+        .available_qualities
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| set.contains(&((*i as u32) + 1)))
+        .map(|(_, q)| q.clone())
+        .collect();
+
+    if !filtered.is_empty() {
+        info.available_qualities = filtered;
+    }
+
+    info
 }
 
 fn is_valid_time_range(r: &str) -> bool {
@@ -921,21 +943,13 @@ pub async fn download_from_url(
     let cached_info = {
         let info = queue::try_get_cached_info(&url).await;
         match (info, &playlist_items) {
-            (Some(mut info), Some(sel))
-                if !sel.is_empty() && info.media_type == MediaType::Playlist =>
-            {
-                let set: std::collections::HashSet<u32> = sel.iter().copied().collect();
-                let filtered: Vec<_> = info
-                    .available_qualities
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| set.contains(&((*i as u32) + 1)))
-                    .map(|(_, q)| q.clone())
-                    .collect();
-                if !filtered.is_empty() {
-                    info.available_qualities = filtered;
-                }
-                Some(info)
+            (Some(info), Some(sel)) if !sel.is_empty() => Some(filter_playlist_info(info, sel)),
+            (None, Some(sel)) if !sel.is_empty() => {
+                let info = downloader
+                    .get_media_info(&url)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Some(filter_playlist_info(info, sel))
             }
             (info, _) => info,
         }

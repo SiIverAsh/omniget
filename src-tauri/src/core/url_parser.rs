@@ -65,7 +65,10 @@ fn parse_youtube(parsed: &url::Url, segments: &[&str]) -> (Option<String>, Parse
         .find(|(k, _)| k == "v")
         .map(|(_, v)| v.to_string())
     {
-        if parsed.query_pairs().any(|(k, _)| k == "list") {
+        if parsed
+            .query_pairs()
+            .any(|(k, list)| k == "list" && !list.starts_with("RD"))
+        {
             return (Some(v), ParsedContentType::Playlist);
         }
         return (Some(v), ParsedContentType::Video);

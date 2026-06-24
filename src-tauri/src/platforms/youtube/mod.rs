@@ -60,20 +60,50 @@ impl YouTubeDownloader {
                 return true;
             }
 
-            let mut has_list = false;
-            let mut has_video = false;
+            let has_video = parsed
+                .query_pairs()
+                .any(|(key, value)| key == "v" && !value.is_empty());
             for (key, value) in parsed.query_pairs() {
                 if key == "list" && !value.is_empty() {
-                    has_list = true;
-                }
-                if key == "v" && !value.is_empty() {
-                    has_video = true;
+                    return !(has_video && is_youtube_radio_list(&value));
                 }
             }
-
-            return has_list && !has_video;
         }
         false
+    }
+
+    pub async fn playlist_media_info(
+        ytdlp_path: &std::path::Path,
+        url: &str,
+    ) -> anyhow::Result<MediaInfo> {
+        let (playlist_title, entries) = ytdlp::get_playlist_info(ytdlp_path, url, &[]).await?;
+
+        if entries.is_empty() {
+            return Err(anyhow!("Playlist empty or unavailable"));
+        }
+
+        let qualities: Vec<MediaVideoQuality> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| MediaVideoQuality {
+                label: format!("{}. {}", i + 1, entry.title),
+                width: 0,
+                height: 0,
+                url: entry.url,
+                format: "ytdlp_playlist".to_string(),
+            })
+            .collect();
+
+        Ok(MediaInfo {
+            title: sanitize_filename::sanitize(&playlist_title),
+            author: playlist_title,
+            platform: "youtube".to_string(),
+            duration_seconds: None,
+            thumbnail_url: None,
+            available_qualities: qualities,
+            media_type: MediaType::Playlist,
+            file_size_bytes: None,
+        })
     }
 
     pub async fn fetch_with_ytdlp(
@@ -81,34 +111,7 @@ impl YouTubeDownloader {
         ytdlp_path: &std::path::Path,
     ) -> anyhow::Result<MediaInfo> {
         if Self::is_playlist_url(url) {
-            let (playlist_title, entries) = ytdlp::get_playlist_info(ytdlp_path, url, &[]).await?;
-
-            if entries.is_empty() {
-                return Err(anyhow!("Playlist empty or unavailable"));
-            }
-
-            let qualities: Vec<MediaVideoQuality> = entries
-                .into_iter()
-                .enumerate()
-                .map(|(i, entry)| MediaVideoQuality {
-                    label: format!("{}. {}", i + 1, entry.title),
-                    width: 0,
-                    height: 0,
-                    url: entry.url,
-                    format: "ytdlp_playlist".to_string(),
-                })
-                .collect();
-
-            return Ok(MediaInfo {
-                title: sanitize_filename::sanitize(&playlist_title),
-                author: playlist_title,
-                platform: "youtube".to_string(),
-                duration_seconds: None,
-                thumbnail_url: None,
-                available_qualities: qualities,
-                media_type: MediaType::Playlist,
-                file_size_bytes: None,
-            });
+            return Self::playlist_media_info(ytdlp_path, url).await;
         }
 
         let _video_id = Self::extract_video_id(url)
@@ -221,14 +224,25 @@ impl YouTubeDownloader {
     }
 }
 
+fn is_youtube_radio_list(list_id: &str) -> bool {
+    list_id.starts_with("RD")
+}
+
 #[cfg(test)]
 mod tests {
     use super::YouTubeDownloader;
 
     #[test]
-    fn watch_url_with_playlist_param_is_single_video() {
-        assert!(!YouTubeDownloader::is_playlist_url(
+    fn watch_url_with_playlist_param_is_playlist() {
+        assert!(YouTubeDownloader::is_playlist_url(
             "https://www.youtube.com/watch?v=abc123&list=PLxyz&index=2",
+        ));
+    }
+
+    #[test]
+    fn watch_url_with_radio_list_is_single_video() {
+        assert!(!YouTubeDownloader::is_playlist_url(
+            "https://www.youtube.com/watch?v=LWcWTw99LzM&list=RD5n1yNYrkqHI&index=9",
         ));
     }
 
@@ -276,34 +290,7 @@ impl PlatformDownloader for YouTubeDownloader {
         })?;
 
         if Self::is_playlist_url(url) {
-            let (playlist_title, entries) = ytdlp::get_playlist_info(&ytdlp_path, url, &[]).await?;
-
-            if entries.is_empty() {
-                return Err(anyhow!("Playlist empty or unavailable"));
-            }
-
-            let qualities: Vec<MediaVideoQuality> = entries
-                .into_iter()
-                .enumerate()
-                .map(|(i, entry)| MediaVideoQuality {
-                    label: format!("{}. {}", i + 1, entry.title),
-                    width: 0,
-                    height: 0,
-                    url: entry.url,
-                    format: "ytdlp_playlist".to_string(),
-                })
-                .collect();
-
-            return Ok(MediaInfo {
-                title: sanitize_filename::sanitize(&playlist_title),
-                author: playlist_title,
-                platform: "youtube".to_string(),
-                duration_seconds: None,
-                thumbnail_url: None,
-                available_qualities: qualities,
-                media_type: MediaType::Playlist,
-                file_size_bytes: None,
-            });
+            return Self::playlist_media_info(&ytdlp_path, url).await;
         }
 
         let _video_id = Self::extract_video_id(url)
@@ -397,6 +384,9 @@ impl YouTubeDownloader {
 
         for (i, entry) in info.available_qualities.iter().enumerate() {
             if opts.cancel_token.is_cancelled() {
+                if success_count > 0 {
+                    break;
+                }
                 anyhow::bail!("Download cancelado");
             }
 
@@ -447,6 +437,13 @@ impl YouTubeDownloader {
                     last_path = result.file_path;
                 }
                 Err(e) => {
+                    if opts.cancel_token.is_cancelled() && success_count > 0 {
+                        tracing::info!(
+                            "Playlist cancelled after {} successful item(s); finishing partial selection",
+                            success_count
+                        );
+                        break;
+                    }
                     tracing::warn!("Playlist video {} falhou: {}", i + 1, e);
                     last_err = Some(e);
                 }
@@ -456,8 +453,9 @@ impl YouTubeDownloader {
         }
 
         if success_count == 0 {
-            return Err(last_err
-                .unwrap_or_else(|| anyhow!("Playlist download finished without any files")));
+            return Err(
+                last_err.unwrap_or_else(|| anyhow!("Playlist download finished without any files"))
+            );
         }
 
         if success_count > 1 {

@@ -1136,6 +1136,9 @@
     max-width: 800px;
     margin: 0 auto;
     width: 100%;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
   }
 
   .downloads-page h2 {

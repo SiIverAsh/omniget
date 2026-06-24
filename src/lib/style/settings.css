@@ -16,7 +16,8 @@
     box-shadow: none;
   }
 
-  .downloads-mac .downloads-list {
+  .downloads-mac .downloads-list,
+  .downloads-mac .download-list {
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     overflow: hidden;

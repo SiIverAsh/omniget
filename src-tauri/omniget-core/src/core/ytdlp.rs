@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -653,6 +654,7 @@ const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/5
 pub const VIDEO_INFO_PROCESS_TIMEOUT_SECS: u64 = 90;
 pub const YOUTUBE_VIDEO_INFO_TOTAL_TIMEOUT_SECS: u64 = 190;
 pub const DEFAULT_VIDEO_INFO_TOTAL_TIMEOUT_SECS: u64 = 110;
+const DOWNLOAD_NO_OUTPUT_TIMEOUT_SECS: u64 = 180;
 
 pub async fn find_ytdlp() -> Option<PathBuf> {
     let _timer_start = std::time::Instant::now();
@@ -1346,23 +1348,22 @@ pub async fn get_video_info(
             attempt + 1
         );
 
-        let result =
-            tokio::time::timeout(
-                std::time::Duration::from_secs(VIDEO_INFO_PROCESS_TIMEOUT_SECS),
-                child.wait_with_output(),
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(VIDEO_INFO_PROCESS_TIMEOUT_SECS),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| {
+            tracing::debug!("[perf] get_video_info took {:?}", _timer_start.elapsed());
+            anyhow!(
+                "Timeout fetching video info ({}s)",
+                VIDEO_INFO_PROCESS_TIMEOUT_SECS
             )
-                .await
-                .map_err(|_| {
-                    tracing::debug!("[perf] get_video_info took {:?}", _timer_start.elapsed());
-                    anyhow!(
-                        "Timeout fetching video info ({}s)",
-                        VIDEO_INFO_PROCESS_TIMEOUT_SECS
-                    )
-                })?
-                .map_err(|e| {
-                    tracing::debug!("[perf] get_video_info took {:?}", _timer_start.elapsed());
-                    anyhow!("Failed to run yt-dlp: {}", e)
-                })?;
+        })?
+        .map_err(|e| {
+            tracing::debug!("[perf] get_video_info took {:?}", _timer_start.elapsed());
+            anyhow!("Failed to run yt-dlp: {}", e)
+        })?;
 
         tracing::debug!(
             "[perf] get_video_info: yt-dlp process exited at {:?} (attempt {})",
@@ -1563,7 +1564,10 @@ pub async fn get_playlist_info(
     url: &str,
     extra_flags: &[String],
 ) -> anyhow::Result<(String, Vec<PlaylistEntry>)> {
-    if is_youtube_url(url) {
+    let listing_url = normalize_playlist_listing_url(url);
+    let url_for_listing = listing_url.as_deref().unwrap_or(url);
+
+    if is_youtube_url(url_for_listing) {
         yt_rate_limiter().acquire().await;
     }
 
@@ -1586,16 +1590,16 @@ pub async fn get_playlist_info(
     ];
     args.extend(js_runtime_args());
 
-    if is_youtube_url(url) {
+    if is_youtube_url(url_for_listing) {
         args.push("--extractor-args".to_string());
         args.push("youtube:player_client=default".to_string());
     }
 
-    append_metadata_cookie_args(&mut args, url, extra_flags, "playlist info");
+    append_metadata_cookie_args(&mut args, url_for_listing, extra_flags, "playlist info");
 
     args.extend(proxy_args());
     args.extend(extra_flags.iter().cloned());
-    args.push(url.to_string());
+    args.push(url_for_listing.to_string());
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(120),
@@ -1634,6 +1638,29 @@ pub async fn get_playlist_info(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(parse_playlist_dump(&stdout))
+}
+
+fn normalize_playlist_listing_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_lowercase();
+    if !(host == "youtube.com" || host.ends_with(".youtube.com") || host == "youtu.be") {
+        return None;
+    }
+
+    let list_id = parsed
+        .query_pairs()
+        .find(|(key, value)| key == "list" && !value.is_empty())
+        .map(|(_, value)| value.to_string())?;
+
+    if list_id.starts_with("RD")
+        && parsed
+            .query_pairs()
+            .any(|(key, value)| key == "v" && !value.is_empty())
+    {
+        return None;
+    }
+
+    Some(format!("https://www.youtube.com/playlist?list={}", list_id))
 }
 
 fn parse_playlist_dump(stdout: &str) -> (String, Vec<PlaylistEntry>) {
@@ -2400,6 +2427,8 @@ pub async fn download_video(
         let captured_path: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let captured_path_writer = captured_path.clone();
         let log_id = log_hook::current_download_id();
+        let last_output_at = Arc::new(Mutex::new(Instant::now()));
+        let last_stdout_at = last_output_at.clone();
 
         let line_reader = tokio::spawn(async move {
             let mut phase = 0u32;
@@ -2411,6 +2440,9 @@ pub async fn download_video(
             let mut last_send = std::time::Instant::now();
             let throttle = std::time::Duration::from_millis(250);
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut guard) = last_stdout_at.lock() {
+                    *guard = Instant::now();
+                }
                 if let Some(id) = log_id {
                     log_hook::emit_log(id, &line);
                 }
@@ -2512,11 +2544,15 @@ pub async fn download_video(
         });
 
         let stderr_log_id = log_hook::current_download_id();
+        let last_stderr_at = last_output_at.clone();
         let stderr_reader = tokio::spawn(async move {
             let mut buf = String::new();
             let stderr_buf = BufReader::new(stderr_pipe);
             let mut stderr_lines = stderr_buf.lines();
             while let Ok(Some(line)) = stderr_lines.next_line().await {
+                if let Ok(mut guard) = last_stderr_at.lock() {
+                    *guard = Instant::now();
+                }
                 if let Some(id) = stderr_log_id {
                     log_hook::emit_log(id, &line);
                 }
@@ -2528,6 +2564,50 @@ pub async fn download_video(
 
         let status = tokio::select! {
             s = child.wait() => s.map_err(|e| anyhow!("yt-dlp process failed: {}", e))?,
+            _ = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    let idle = last_output_at
+                        .lock()
+                        .map(|t| t.elapsed())
+                        .unwrap_or_else(|_| Duration::from_secs(0));
+                    if idle >= Duration::from_secs(DOWNLOAD_NO_OUTPUT_TIMEOUT_SECS) {
+                        break;
+                    }
+                    if let Some(id) = registered_download_id {
+                        if idle >= Duration::from_secs(45) {
+                            log_hook::emit_log(
+                                id,
+                                &format!(
+                                    "[yt-dlp] still waiting for output from downloader (idle {}s)",
+                                    idle.as_secs()
+                                ),
+                            );
+                        }
+                    }
+                }
+            } => {
+                let _ = child.kill().await;
+                if let Some(download_id) = registered_download_id {
+                    unregister_download_process(download_id);
+                    log_hook::emit_log(
+                        download_id,
+                        &format!(
+                            "[yt-dlp] no output for {}s; restarting downloader",
+                            DOWNLOAD_NO_OUTPUT_TIMEOUT_SECS
+                        ),
+                    );
+                }
+                let _ = line_reader.await;
+                let stderr_content = stderr_reader.await.unwrap_or_default();
+                cleanup_part_files(output_dir).await;
+                last_error = if stderr_content.trim().is_empty() {
+                    format!("yt-dlp produced no output for {}s", DOWNLOAD_NO_OUTPUT_TIMEOUT_SECS)
+                } else {
+                    stderr_content
+                };
+                continue;
+            }
             _ = cancel_token.cancelled() => {
                 let _ = child.kill().await;
                 if let Some(download_id) = registered_download_id {
@@ -2838,10 +2918,16 @@ async fn convert_vtt_sidecars_to_srt(video_path: &Path) {
             .await;
         match result {
             Ok(out) if out.status.success() => {
-                tracing::info!("[yt-dlp] converted subtitle sidecar {} to srt (vtt kept)", name);
+                tracing::info!(
+                    "[yt-dlp] converted subtitle sidecar {} to srt (vtt kept)",
+                    name
+                );
             }
             _ => {
-                tracing::warn!("[yt-dlp] failed to convert subtitle sidecar {} to srt", name);
+                tracing::warn!(
+                    "[yt-dlp] failed to convert subtitle sidecar {} to srt",
+                    name
+                );
                 let _ = std::fs::remove_file(&srt_path);
             }
         }
@@ -3440,6 +3526,27 @@ mod tests {
     #[test]
     fn parse_progress_download_prefix() {
         assert_eq!(parse_progress_line("download:  45.2%"), Some(45.2));
+    }
+
+    #[test]
+    fn youtube_watch_playlist_url_is_normalized_for_listing() {
+        assert_eq!(
+            normalize_playlist_listing_url(
+                "https://www.youtube.com/watch?v=aircAruvnKk&list=PLZHQObOWTQDNU6R1_67000Dx_ZCJB-3pi0"
+            )
+            .as_deref(),
+            Some("https://www.youtube.com/playlist?list=PLZHQObOWTQDNU6R1_67000Dx_ZCJB-3pi0")
+        );
+    }
+
+    #[test]
+    fn youtube_watch_radio_list_is_not_normalized_for_listing() {
+        assert_eq!(
+            normalize_playlist_listing_url(
+                "https://www.youtube.com/watch?v=LWcWTw99LzM&list=RD5n1yNYrkqHI&index=9"
+            ),
+            None
+        );
     }
 
     #[test]

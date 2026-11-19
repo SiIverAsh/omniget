@@ -441,7 +441,6 @@
  ],
  "zh-TW": [
   "canvas.engine.spawn.claude",
-  "canvas.floors.mode.worktree",
   "canvas.settings.modAlt",
   "canvas.term.agent.claude",
   "canvas.term.agent.gemini",
@@ -456,12 +455,9 @@
   "settings.cookies.paste_content_placeholder",
   "settings.download.bilibili_cdn_hosts_placeholder",
   "settings.integrations.superpowers.league",
-  "settings.integrations.superpowers.tube",
   "tube.settings.lyrics_youtube",
-  "tube.title",
   "washmybelly.perf.method.metal_hud",
-  "washmybelly.security.class.app_store",
-  "washmybelly.uninstall.source.homebrew_formula"
+  "washmybelly.security.class.app_store"
  ],
  "zh": [
   "canvas.engine.spawn.claude",
@@ -479,9 +475,7 @@
   "settings.cookies.paste_content_placeholder",
   "settings.download.bilibili_cdn_hosts_placeholder",
   "settings.integrations.superpowers.league",
-  "settings.integrations.superpowers.tube",
   "tube.settings.lyrics_youtube",
-  "tube.title",
   "washmybelly.perf.method.metal_hud",
   "washmybelly.security.class.app_store"
  ]

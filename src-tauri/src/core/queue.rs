@@ -328,6 +328,47 @@ impl QueueItem {
         self.started_at_ms = None;
         self.finished_at_ms = None;
     }
+
+    fn uses_download_slot(&self, status: &QueueStatus) -> bool {
+        *status == QueueStatus::Active && self.platform != "telegram"
+    }
+
+    fn pause(&mut self) -> bool {
+        match self.status {
+            QueueStatus::Seeding => {}
+            QueueStatus::Active if self.platform == "mcp_worker" => {
+                self.cancel_token.cancel();
+                self.phase = Some("paused".into());
+            }
+            QueueStatus::Active if self.platform == "magnet" => {}
+            QueueStatus::Active if omniget_core::core::ytdlp::pause_download_process(self.id) => {}
+            _ => return false,
+        }
+        self.status = QueueStatus::Paused;
+        self.speed_bytes_per_sec = 0.0;
+        self.eta_seconds = None;
+        true
+    }
+
+    fn resume(&mut self, slots: &mut u32) -> bool {
+        if self.status != QueueStatus::Paused || self.platform == "mcp_worker" {
+            return false;
+        }
+        let status = status_after_resume(self);
+        let needs_slot = self.uses_download_slot(&status);
+        if needs_slot && *slots == 0 {
+            return false;
+        }
+        if self.platform != "magnet" && !omniget_core::core::ytdlp::resume_download_process(self.id)
+        {
+            return false;
+        }
+        if needs_slot {
+            *slots -= 1;
+        }
+        self.status = status;
+        true
+    }
 }
 
 pub struct DownloadQueue {
@@ -598,12 +639,16 @@ impl DownloadQueue {
     pub fn active_count(&self) -> u32 {
         self.items
             .iter()
-            .filter(|i| i.status == QueueStatus::Active && i.platform != "telegram")
+            .filter(|i| i.uses_download_slot(&i.status))
             .count() as u32
     }
 
+    fn available_slots(&self) -> u32 {
+        self.max_concurrent.saturating_sub(self.active_count())
+    }
+
     pub fn next_queued_ids(&self) -> Vec<u64> {
-        let slots = self.max_concurrent.saturating_sub(self.active_count()) as usize;
+        let slots = self.available_slots() as usize;
         let now = now_ms();
         self.items
             .iter()
@@ -838,92 +883,36 @@ impl DownloadQueue {
     }
 
     pub fn pause(&mut self, id: u64) -> bool {
-        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
-            if item.status == QueueStatus::Seeding {
-                item.status = QueueStatus::Paused;
-                item.speed_bytes_per_sec = 0.0;
-                item.eta_seconds = None;
-                return true;
-            }
-            if item.status == QueueStatus::Active {
-                if item.platform == "mcp_worker" {
-                    item.cancel_token.cancel();
-                    item.status = QueueStatus::Paused;
-                    item.phase = Some("paused".into());
-                    item.speed_bytes_per_sec = 0.0;
-                    item.eta_seconds = None;
-                    return true;
-                }
-                if item.platform != "magnet"
-                    && !omniget_core::core::ytdlp::pause_download_process(id)
-                {
-                    return false;
-                }
-                item.status = QueueStatus::Paused;
-                item.speed_bytes_per_sec = 0.0;
-                item.eta_seconds = None;
-                return true;
-            }
-        }
-        false
+        self.items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .is_some_and(QueueItem::pause)
     }
 
     pub fn resume(&mut self, id: u64) -> bool {
-        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
-            if item.status == QueueStatus::Paused {
-                if item.platform == "mcp_worker" {
-                    return false;
-                }
-                if item.platform != "magnet"
-                    && !omniget_core::core::ytdlp::resume_download_process(id)
-                {
-                    return false;
-                }
-                item.status = status_after_resume(item);
-                return true;
-            }
-        }
-        false
+        let mut slots = self.available_slots();
+        self.items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .is_some_and(|item| item.resume(&mut slots))
     }
 
     pub fn pause_all(&mut self) -> Vec<(u64, Option<usize>)> {
-        let mut paused = Vec::new();
-        for item in self.items.iter_mut() {
-            if item.status == QueueStatus::Seeding {
-                item.status = QueueStatus::Paused;
-                item.speed_bytes_per_sec = 0.0;
-                item.eta_seconds = None;
-                paused.push((item.id, item.torrent_id));
-            } else if item.status == QueueStatus::Active {
-                if item.platform != "magnet"
-                    && !omniget_core::core::ytdlp::pause_download_process(item.id)
-                {
-                    continue;
-                }
-                item.status = QueueStatus::Paused;
-                item.speed_bytes_per_sec = 0.0;
-                item.eta_seconds = None;
-                paused.push((item.id, item.torrent_id));
-            }
-        }
-        paused
+        self.items
+            .iter_mut()
+            .filter_map(|item| item.pause().then_some((item.id, item.torrent_id)))
+            .collect()
     }
 
     pub fn resume_all(&mut self) -> Vec<(u64, Option<usize>)> {
-        let mut resumed = Vec::new();
-        for item in self.items.iter_mut() {
-            if item.status == QueueStatus::Paused {
-                let tid = item.torrent_id;
-                if item.platform != "magnet"
-                    && !omniget_core::core::ytdlp::resume_download_process(item.id)
-                {
-                    continue;
-                }
-                item.status = status_after_resume(item);
-                resumed.push((item.id, tid));
-            }
-        }
-        resumed
+        let mut slots = self.available_slots();
+        self.items
+            .iter_mut()
+            .filter_map(|item| {
+                item.resume(&mut slots)
+                    .then_some((item.id, item.torrent_id))
+            })
+            .collect()
     }
 
     pub fn reorder(&mut self, ids_in_order: Vec<u64>) -> bool {
@@ -2820,14 +2809,13 @@ mod source_url_tests {
 mod seeding_tests {
     use super::*;
 
-    fn queue_with_torrent() -> DownloadQueue {
-        let mut queue = DownloadQueue::new(2);
+    fn enqueue_torrent(queue: &mut DownloadQueue, id: u64) {
         let downloader = Arc::new(crate::platforms::magnet::MagnetDownloader::new(Arc::new(
             tokio::sync::Mutex::new(None),
         )));
         queue.enqueue(
-            1,
-            "magnet:?xt=urn:btih:abc".to_string(),
+            id,
+            format!("magnet:?xt=urn:btih:test{id}"),
             "magnet".to_string(),
             "t".to_string(),
             "/tmp".to_string(),
@@ -2850,6 +2838,11 @@ mod seeding_tests {
             None,
             None,
         );
+    }
+
+    fn queue_with_torrent() -> DownloadQueue {
+        let mut queue = DownloadQueue::new(2);
+        enqueue_torrent(&mut queue, 1);
         queue.mark_active(1);
         queue
     }
@@ -2880,6 +2873,57 @@ mod seeding_tests {
         assert!(queue.pause(1));
         assert!(queue.resume(1));
         assert_eq!(queue.items[0].status, QueueStatus::Active);
+    }
+
+    #[test]
+    fn a_paused_download_waits_until_a_slot_is_free() {
+        let mut queue = queue_with_torrent();
+        queue.max_concurrent = 1;
+        enqueue_torrent(&mut queue, 2);
+        assert!(queue.pause(1));
+        assert_eq!(queue.next_queued_ids(), vec![2]);
+        queue.mark_active(2);
+        assert!(!queue.resume(1));
+        assert_eq!(queue.items[0].status, QueueStatus::Paused);
+        assert!(queue.pause(2));
+        assert!(queue.resume(1));
+        assert_eq!(queue.active_count(), 1);
+    }
+
+    #[test]
+    fn bulk_resume_fills_available_slots_and_also_restores_seeding() {
+        let mut queue = queue_with_torrent();
+        enqueue_torrent(&mut queue, 2);
+        enqueue_torrent(&mut queue, 3);
+        queue.mark_active(2);
+        queue.mark_active(3);
+        queue.mark_seeding(3, None, None, Some(7));
+        assert_eq!(queue.pause_all().len(), 3);
+        queue.max_concurrent = 1;
+
+        assert_eq!(queue.resume_all(), vec![(1, None), (3, Some(7))]);
+        assert_eq!(queue.items[1].status, QueueStatus::Paused);
+        assert_eq!(queue.items[2].status, QueueStatus::Seeding);
+        assert_eq!(queue.active_count(), 1);
+    }
+
+    #[test]
+    fn bulk_pause_cancels_active_mcp_workers() {
+        let mut queue = queue_with_torrent();
+        let item = &mut queue.items[0];
+        item.platform = "mcp_worker".into();
+        item.speed_bytes_per_sec = 1024.0;
+        item.eta_seconds = Some(1);
+        let cancel_token = item.cancel_token.clone();
+
+        assert_eq!(queue.pause_all(), vec![(1, None)]);
+        let item = &queue.items[0];
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(item.status, QueueStatus::Paused);
+        assert_eq!(item.phase.as_deref(), Some("paused"));
+        assert_eq!(item.speed_bytes_per_sec, 0.0);
+        assert_eq!(item.eta_seconds, None);
+        assert!(queue.resume_all().is_empty());
     }
 }
 
